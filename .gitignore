@@ -1,0 +1,26 @@
+# Rust build artifacts
+/target/
+
+# cpp-map generated index
+/.ai-context/
+
+# Local Codex/agent workspace metadata
+/.agents/
+/.codex/
+
+# Editor and OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+Desktop.ini
+
+# Local logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# Private/local test fixtures
+/tests/

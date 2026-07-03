@@ -1,0 +1,30 @@
+[package]
+name = "cpp-map"
+version = "1.0.0"
+authors = ["Hiragi0w0"]
+edition = "2024"
+description = "AI-agent-oriented context compression CLI for C++Builder projects"
+readme = "README.md"
+repository = "https://github.com/Hiragi0w0/cpp-map"
+license = "MIT OR Apache-2.0"
+keywords = ["cppbuilder", "cli", "mcp", "context", "ai"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.85"
+publish = false
+
+[[bin]]
+name = "cpp-map"
+path = "src/main.rs"
+
+[package.metadata.cpp-map]
+edition = "2026"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+encoding_rs = "0.8"
+
+[profile.release]
+strip = true
