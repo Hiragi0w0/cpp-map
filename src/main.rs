@@ -123,13 +123,20 @@ fn main() -> ExitCode {
 
     let result: Result<Value, String> = match &cli.cmd {
         Cmd::Scan { project_path } => commands::cmd_scan(project_path),
-        Cmd::Overview { project_path } => commands::cmd_overview(project_path),
+        Cmd::Overview { project_path } => {
+            commands::cmd_overview(project_path, scan::FreshnessMode::AutoRefresh)
+        }
         Cmd::Files {
             project_path,
             role,
             limit,
             ndjson,
-        } => match commands::cmd_files(project_path, role.as_deref(), *limit) {
+        } => match commands::cmd_files(
+            project_path,
+            role.as_deref(),
+            *limit,
+            scan::FreshnessMode::AutoRefresh,
+        ) {
             Ok(files) => {
                 if *ndjson {
                     for f in &files {
@@ -141,19 +148,35 @@ fn main() -> ExitCode {
             }
             Err(e) => Err(e),
         },
-        Cmd::Symbols { project_path, file } => commands::cmd_symbols(project_path, file),
-        Cmd::Includes { project_path, file } => commands::cmd_includes(project_path, file),
-        Cmd::Related { project_path, file } => commands::cmd_related(project_path, file),
+        Cmd::Symbols { project_path, file } => {
+            commands::cmd_symbols(project_path, file, scan::FreshnessMode::AutoRefresh)
+        }
+        Cmd::Includes { project_path, file } => {
+            commands::cmd_includes(project_path, file, scan::FreshnessMode::AutoRefresh)
+        }
+        Cmd::Related { project_path, file } => {
+            commands::cmd_related(project_path, file, scan::FreshnessMode::AutoRefresh)
+        }
         Cmd::Focus {
             project_path,
             keyword,
             limit,
-        } => commands::cmd_focus(project_path, keyword, *limit),
+        } => commands::cmd_focus(
+            project_path,
+            keyword,
+            *limit,
+            scan::FreshnessMode::AutoRefresh,
+        ),
         Cmd::Refs {
             project_path,
             symbol,
             limit,
-        } => commands::cmd_refs(project_path, symbol, *limit),
+        } => commands::cmd_refs(
+            project_path,
+            symbol,
+            *limit,
+            scan::FreshnessMode::AutoRefresh,
+        ),
         Cmd::Snippet {
             project_path,
             symbol,
@@ -168,6 +191,7 @@ fn main() -> ExitCode {
             owner.as_deref(),
             *context,
             (*max_lines).max(1),
+            scan::FreshnessMode::AutoRefresh,
         ),
         Cmd::Mcp {
             project_path,

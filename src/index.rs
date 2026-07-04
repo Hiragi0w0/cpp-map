@@ -10,7 +10,7 @@ pub const INDEX_DIR: &str = ".ai-context";
 pub const INDEX_FILE: &str = "index.json";
 pub const INDEX_VERSION: u32 = 3;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Index {
     pub version: u32,
     pub generated_at: u64,
@@ -22,7 +22,7 @@ pub struct Index {
     pub ignored_count: u32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct FileEntry {
     pub kind: String, // cpp | header | cbproj
     pub role: String,

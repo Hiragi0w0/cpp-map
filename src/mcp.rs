@@ -5,6 +5,7 @@
 //! Every tool reuses the same core functions as the CLI subcommands.
 
 use crate::commands;
+use crate::scan;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -178,24 +179,30 @@ fn resolve_project(args: &Value, default_project: Option<&Path>) -> Result<PathB
     }
 }
 
+/// Canonicalized home-directory candidates from every home-related env var.
+/// Both `USERPROFILE` and `HOME` are checked (and may both be set, e.g. under
+/// MSYS/WSL-adjacent shells on Windows) so a project root is rejected as the
+/// user's home directory regardless of which variable points at it.
+fn home_dir_candidates() -> Vec<PathBuf> {
+    ["USERPROFILE", "HOME"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .filter_map(|p| p.canonicalize().ok())
+        .collect()
+}
+
 /// Filesystem root (`/`, `C:\`, ...) or the user's home directory itself.
 /// Scanning/indexing either by mistake would walk far more than a project.
 fn is_disallowed_root(path: &Path) -> bool {
+    is_disallowed_root_among(path, &home_dir_candidates())
+}
+
+fn is_disallowed_root_among(path: &Path, homes: &[PathBuf]) -> bool {
     if path.parent().is_none() {
         return true;
     }
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .ok()
-        .map(PathBuf::from);
-    if let Some(home) = home {
-        if let Ok(home_canon) = home.canonicalize() {
-            if home_canon == path {
-                return true;
-            }
-        }
-    }
-    false
+    homes.iter().any(|home| home == path)
 }
 
 fn run_tool(
@@ -213,30 +220,42 @@ fn run_tool(
     };
     let usize_arg = |key: &str| args.get(key).and_then(|v| v.as_u64()).map(|n| n as usize);
 
+    // Without `--allow-auto-scan`, query tools must never trigger an implicit
+    // index rebuild/write inside `scan::ensure_fresh`; only an explicit `scan`
+    // tool call may write `.ai-context/index.json`.
+    let mode = if allow_auto_scan {
+        scan::FreshnessMode::AutoRefresh
+    } else {
+        scan::FreshnessMode::ReadOnly
+    };
+
     let call = || -> Result<Value, String> {
         match name {
             "scan" => commands::cmd_scan(&project),
-            "overview" => commands::cmd_overview(&project),
+            "overview" => commands::cmd_overview(&project, mode),
             "files" => {
                 let role = args
                     .get("role")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                let files = commands::cmd_files(&project, role.as_deref(), usize_arg("limit"))?;
+                let files =
+                    commands::cmd_files(&project, role.as_deref(), usize_arg("limit"), mode)?;
                 Ok(json!({ "files": files }))
             }
-            "symbols" => commands::cmd_symbols(&project, &str_arg("file")?),
-            "includes" => commands::cmd_includes(&project, &str_arg("file")?),
-            "related" => commands::cmd_related(&project, &str_arg("file")?),
+            "symbols" => commands::cmd_symbols(&project, &str_arg("file")?, mode),
+            "includes" => commands::cmd_includes(&project, &str_arg("file")?, mode),
+            "related" => commands::cmd_related(&project, &str_arg("file")?, mode),
             "focus" => commands::cmd_focus(
                 &project,
                 &str_arg("keyword")?,
                 usize_arg("limit").unwrap_or(20),
+                mode,
             ),
             "refs" => commands::cmd_refs(
                 &project,
                 &str_arg("symbol")?,
                 usize_arg("limit").unwrap_or(100),
+                mode,
             ),
             "snippet" => commands::cmd_snippet(
                 &project,
@@ -245,6 +264,7 @@ fn run_tool(
                 args.get("owner").and_then(|v| v.as_str()),
                 usize_arg("context").unwrap_or(0),
                 usize_arg("max_lines").unwrap_or(300).max(1),
+                mode,
             ),
             _ => Err(format!("unknown tool: {name}")),
         }
@@ -504,5 +524,76 @@ mod tests {
                 .iter()
                 .any(|value| value.as_str() == Some("project_path"))
         );
+    }
+
+    #[test]
+    fn is_disallowed_root_rejects_any_home_candidate() {
+        // Exercises the USERPROFILE/HOME comparison logic without touching
+        // real env vars (which would race with other tests running in the
+        // same process). Both candidates must independently be rejected.
+        let home_a = temp_project_dir();
+        let home_b = temp_project_dir();
+        let project = temp_project_dir();
+        let homes = [home_a.clone(), home_b.clone()];
+
+        assert!(is_disallowed_root_among(&home_a, &homes));
+        assert!(is_disallowed_root_among(&home_b, &homes));
+        assert!(!is_disallowed_root_among(&project, &homes));
+
+        let _ = fs::remove_dir_all(home_a);
+        let _ = fs::remove_dir_all(home_b);
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn is_disallowed_root_rejects_filesystem_root() {
+        let root_like = if cfg!(windows) {
+            PathBuf::from("C:\\")
+        } else {
+            PathBuf::from("/")
+        };
+        assert!(is_disallowed_root_among(&root_like, &[]));
+    }
+
+    fn write_source(dir: &Path, name: &str, contents: &str) {
+        fs::write(dir.join(name), contents).expect("write source file");
+    }
+
+    #[test]
+    fn readonly_mode_blocks_implicit_index_write_without_allow_auto_scan() {
+        let project = temp_project_dir();
+        write_source(&project, "main.cpp", "int main() { return 0; }");
+
+        let err = run_tool("overview", &json!({}), Some(project.as_path()), false)
+            .expect_err("query without an index must error when auto-scan is disallowed");
+
+        assert!(err.contains("auto-scan is disabled"));
+        assert!(err.contains("--allow-auto-scan"));
+        assert!(
+            !crate::index::index_path(&project).exists(),
+            "readonly mode must not write .ai-context/index.json"
+        );
+
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn allow_auto_scan_lets_query_build_the_index() {
+        let project = temp_project_dir();
+        write_source(&project, "main.cpp", "int main() { return 0; }");
+
+        let result = run_tool("overview", &json!({}), Some(project.as_path()), true)
+            .expect("query should auto-scan when allowed");
+
+        assert_eq!(
+            result.get("project_type").and_then(|v| v.as_str()),
+            Some("cpp")
+        );
+        assert!(
+            crate::index::index_path(&project).exists(),
+            "auto-scan mode should write .ai-context/index.json"
+        );
+
+        let _ = fs::remove_dir_all(project);
     }
 }
