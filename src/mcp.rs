@@ -110,7 +110,11 @@ fn initialize_result(params: &Value) -> Value {
     })
 }
 
-fn handle_tool_call(params: &Value, default_project: Option<&Path>, allow_auto_scan: bool) -> Value {
+fn handle_tool_call(
+    params: &Value,
+    default_project: Option<&Path>,
+    allow_auto_scan: bool,
+) -> Value {
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params
         .get("arguments")
@@ -168,10 +172,9 @@ fn resolve_project(args: &Value, default_project: Option<&Path>) -> Result<PathB
             }
             Ok(canonical)
         }
-        (None, None) => {
-            Err("missing project_path (server was started without a default project root)"
-                .to_string())
-        }
+        (None, None) => Err(
+            "missing project_path (server was started without a default project root)".to_string(),
+        ),
     }
 }
 
@@ -496,8 +499,10 @@ mod tests {
             .expect("required array");
 
         assert!(props.contains_key("project_path"));
-        assert!(required
-            .iter()
-            .any(|value| value.as_str() == Some("project_path")));
+        assert!(
+            required
+                .iter()
+                .any(|value| value.as_str() == Some("project_path"))
+        );
     }
 }
