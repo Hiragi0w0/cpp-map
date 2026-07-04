@@ -97,7 +97,13 @@ enum Cmd {
     /// Run as an MCP server over stdio, exposing every command as a tool
     Mcp {
         /// Default project root; when given, tools may omit project_path
+        /// and cannot override it (pinned root).
         project_path: Option<PathBuf>,
+        /// Allow the server to auto-run `scan` (writing .ai-context/index.json)
+        /// when a query's index is missing or stale, instead of returning an
+        /// error asking the caller to run `scan` explicitly first.
+        #[arg(long)]
+        allow_auto_scan: bool,
     },
 }
 
@@ -117,13 +123,20 @@ fn main() -> ExitCode {
 
     let result: Result<Value, String> = match &cli.cmd {
         Cmd::Scan { project_path } => commands::cmd_scan(project_path),
-        Cmd::Overview { project_path } => commands::cmd_overview(project_path),
+        Cmd::Overview { project_path } => {
+            commands::cmd_overview(project_path, scan::FreshnessMode::AutoRefresh)
+        }
         Cmd::Files {
             project_path,
             role,
             limit,
             ndjson,
-        } => match commands::cmd_files(project_path, role.as_deref(), *limit) {
+        } => match commands::cmd_files(
+            project_path,
+            role.as_deref(),
+            *limit,
+            scan::FreshnessMode::AutoRefresh,
+        ) {
             Ok(files) => {
                 if *ndjson {
                     for f in &files {
@@ -135,19 +148,35 @@ fn main() -> ExitCode {
             }
             Err(e) => Err(e),
         },
-        Cmd::Symbols { project_path, file } => commands::cmd_symbols(project_path, file),
-        Cmd::Includes { project_path, file } => commands::cmd_includes(project_path, file),
-        Cmd::Related { project_path, file } => commands::cmd_related(project_path, file),
+        Cmd::Symbols { project_path, file } => {
+            commands::cmd_symbols(project_path, file, scan::FreshnessMode::AutoRefresh)
+        }
+        Cmd::Includes { project_path, file } => {
+            commands::cmd_includes(project_path, file, scan::FreshnessMode::AutoRefresh)
+        }
+        Cmd::Related { project_path, file } => {
+            commands::cmd_related(project_path, file, scan::FreshnessMode::AutoRefresh)
+        }
         Cmd::Focus {
             project_path,
             keyword,
             limit,
-        } => commands::cmd_focus(project_path, keyword, *limit),
+        } => commands::cmd_focus(
+            project_path,
+            keyword,
+            *limit,
+            scan::FreshnessMode::AutoRefresh,
+        ),
         Cmd::Refs {
             project_path,
             symbol,
             limit,
-        } => commands::cmd_refs(project_path, symbol, *limit),
+        } => commands::cmd_refs(
+            project_path,
+            symbol,
+            *limit,
+            scan::FreshnessMode::AutoRefresh,
+        ),
         Cmd::Snippet {
             project_path,
             symbol,
@@ -162,10 +191,14 @@ fn main() -> ExitCode {
             owner.as_deref(),
             *context,
             (*max_lines).max(1),
+            scan::FreshnessMode::AutoRefresh,
         ),
-        Cmd::Mcp { project_path } => {
+        Cmd::Mcp {
+            project_path,
+            allow_auto_scan,
+        } => {
             // stdout is the protocol channel: report fatal errors on stderr only
-            return match mcp::serve(project_path.clone()) {
+            return match mcp::serve(project_path.clone(), *allow_auto_scan) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("cpp-map mcp: {e}");

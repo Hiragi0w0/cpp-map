@@ -23,8 +23,8 @@ pub fn cmd_scan(project: &Path) -> Result<Value, String> {
     }))
 }
 
-pub fn cmd_overview(project: &Path) -> Result<Value, String> {
-    let index = scan::ensure_fresh(project)?;
+pub fn cmd_overview(project: &Path, mode: scan::FreshnessMode) -> Result<Value, String> {
+    let index = scan::ensure_fresh(project, mode)?;
 
     let mut entry_candidates: Vec<String> = index
         .files
@@ -97,8 +97,9 @@ pub fn cmd_files(
     project: &Path,
     role: Option<&str>,
     limit: Option<usize>,
+    mode: scan::FreshnessMode,
 ) -> Result<Vec<Value>, String> {
-    let index = scan::ensure_fresh(project)?;
+    let index = scan::ensure_fresh(project, mode)?;
     let mut out: Vec<Value> = index
         .files
         .keys()
@@ -111,8 +112,8 @@ pub fn cmd_files(
     Ok(out)
 }
 
-pub fn cmd_symbols(project: &Path, file: &str) -> Result<Value, String> {
-    let index = scan::ensure_fresh(project)?;
+pub fn cmd_symbols(project: &Path, file: &str, mode: scan::FreshnessMode) -> Result<Value, String> {
+    let index = scan::ensure_fresh(project, mode)?;
     let rel = resolve_file_arg(&index, file)?;
     Ok(json!({
         "file": rel,
@@ -120,8 +121,12 @@ pub fn cmd_symbols(project: &Path, file: &str) -> Result<Value, String> {
     }))
 }
 
-pub fn cmd_includes(project: &Path, file: &str) -> Result<Value, String> {
-    let index = scan::ensure_fresh(project)?;
+pub fn cmd_includes(
+    project: &Path,
+    file: &str,
+    mode: scan::FreshnessMode,
+) -> Result<Value, String> {
+    let index = scan::ensure_fresh(project, mode)?;
     let rel = resolve_file_arg(&index, file)?;
     let e = &index.files[&rel];
     let included_by: Vec<&String> = index
@@ -138,8 +143,8 @@ pub fn cmd_includes(project: &Path, file: &str) -> Result<Value, String> {
     }))
 }
 
-pub fn cmd_related(project: &Path, file: &str) -> Result<Value, String> {
-    let index = scan::ensure_fresh(project)?;
+pub fn cmd_related(project: &Path, file: &str, mode: scan::FreshnessMode) -> Result<Value, String> {
+    let index = scan::ensure_fresh(project, mode)?;
     let rel = resolve_file_arg(&index, file)?;
     let entry = &index.files[&rel];
 
@@ -202,8 +207,9 @@ pub fn cmd_snippet(
     owner: Option<&str>,
     context: usize,
     max_lines: usize,
+    mode: scan::FreshnessMode,
 ) -> Result<Value, String> {
-    let index = scan::ensure_fresh(project)?;
+    let index = scan::ensure_fresh(project, mode)?;
     let scope: Vec<String> = match file {
         Some(f) => vec![resolve_file_arg(&index, f)?],
         None => index.files.keys().cloned().collect(),
@@ -291,14 +297,19 @@ pub fn cmd_snippet(
     Ok(out)
 }
 
-pub fn cmd_refs(project: &Path, symbol: &str, limit: usize) -> Result<Value, String> {
+pub fn cmd_refs(
+    project: &Path,
+    symbol: &str,
+    limit: usize,
+    mode: scan::FreshnessMode,
+) -> Result<Value, String> {
     let sym = symbol.trim();
     if sym.is_empty() || !sym.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(format!(
             "invalid_symbol: expected a C++ identifier, got {symbol:?}"
         ));
     }
-    let index = scan::ensure_fresh(project)?;
+    let index = scan::ensure_fresh(project, mode)?;
     let word = Regex::new(&format!(r"\b{}\b", regex::escape(sym))).map_err(|e| e.to_string())?;
 
     // definitions/declarations known to the index; their lines are excluded
@@ -373,8 +384,13 @@ struct FocusHit {
     matched_symbols: Vec<Value>,
 }
 
-pub fn cmd_focus(project: &Path, keyword: &str, limit: usize) -> Result<Value, String> {
-    let index = scan::ensure_fresh(project)?;
+pub fn cmd_focus(
+    project: &Path,
+    keyword: &str,
+    limit: usize,
+    mode: scan::FreshnessMode,
+) -> Result<Value, String> {
+    let index = scan::ensure_fresh(project, mode)?;
     let kw = keyword.to_lowercase();
     if kw.trim().is_empty() {
         return Err("empty_keyword".into());

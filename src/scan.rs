@@ -44,6 +44,26 @@ pub struct ScanResult {
     pub counts: BTreeMap<String, u32>,
 }
 
+/// Controls whether `ensure_fresh` may write a rebuilt/updated index to disk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FreshnessMode {
+    /// Rebuild and save the index whenever it's missing-version, corrupt, or
+    /// drifted from the files on disk. CLI default.
+    AutoRefresh,
+    /// Never write `.ai-context/index.json` implicitly. Any staleness is
+    /// surfaced as an error instead of being silently fixed. Used by the MCP
+    /// server unless started with `--allow-auto-scan`.
+    ReadOnly,
+}
+
+fn readonly_error(reason: &str, project: &Path) -> String {
+    format!(
+        "{reason} (auto-scan is disabled: run `cpp-map scan {}` explicitly, or restart the \
+         MCP server with --allow-auto-scan to allow implicit index writes)",
+        project.display()
+    )
+}
+
 /// Full scan: parse every target file and build a fresh index.
 pub fn scan(project: &Path) -> Result<ScanResult, String> {
     let (walked, ignored) = walk_project(project)?;
@@ -61,19 +81,27 @@ pub fn scan(project: &Path) -> Result<ScanResult, String> {
 /// mtime/size changed (plus additions/removals). A stale-version or corrupt
 /// index is rebuilt from scratch; a missing index stays an error so the very
 /// first `scan` remains explicit.
-pub fn ensure_fresh(project: &Path) -> Result<Index, String> {
+///
+/// In `FreshnessMode::ReadOnly`, none of that rebuilding/writing happens:
+/// a stale-version, corrupt, or drifted index is reported as an error
+/// instead, and `.ai-context/index.json` is left untouched.
+pub fn ensure_fresh(project: &Path, mode: FreshnessMode) -> Result<Index, String> {
     let mut index = match crate::index::load(project) {
         Ok(i) => i,
         Err(e) if e.starts_with("index_stale") || e.starts_with("index_corrupt") => {
+            if mode == FreshnessMode::ReadOnly {
+                return Err(readonly_error(&e, project));
+            }
             let result = scan(project)?;
             crate::index::save(project, &result.index)?;
             return Ok(result.index);
         }
+        Err(e) if mode == FreshnessMode::ReadOnly => return Err(readonly_error(&e, project)),
         Err(e) => return Err(e),
     };
 
     let (walked, ignored) = walk_project(project)?;
-    let mut changed = false;
+    let mut indexed_changed = false;
 
     let current: BTreeMap<&str, &WalkedFile> = walked.iter().map(|w| (w.rel.as_str(), w)).collect();
     let removed: Vec<String> = index
@@ -84,7 +112,7 @@ pub fn ensure_fresh(project: &Path) -> Result<Index, String> {
         .collect();
     for k in removed {
         index.files.remove(&k);
-        changed = true;
+        indexed_changed = true;
     }
     for w in &walked {
         let fresh = index
@@ -93,15 +121,22 @@ pub fn ensure_fresh(project: &Path) -> Result<Index, String> {
             .is_some_and(|e| e.mtime_ms == w.mtime_ms && e.size == w.size);
         if !fresh {
             index.files.insert(w.rel.clone(), parse_entry(project, w)?);
-            changed = true;
+            indexed_changed = true;
         }
     }
-    if index.ignored_count != ignored {
-        index.ignored_count = ignored;
-        changed = true;
-    }
+    let ignored_changed = index.ignored_count != ignored;
 
-    if changed {
+    if indexed_changed {
+        if mode == FreshnessMode::ReadOnly {
+            return Err(readonly_error(
+                &format!(
+                    "index_stale: files in {} changed since the last scan",
+                    project.display()
+                ),
+                project,
+            ));
+        }
+        index.ignored_count = ignored;
         finalize(&mut index.files);
         index.project_files = index
             .files
@@ -117,7 +152,21 @@ pub fn ensure_fresh(project: &Path) -> Result<Index, String> {
         .into();
         index.generated_at = now_secs();
         crate::index::save(project, &index)?;
+        return Ok(index);
     }
+
+    if ignored_changed {
+        if mode == FreshnessMode::ReadOnly {
+            // Only the ignored-file count drifted; the indexed files this
+            // query actually reads are unchanged, so serve the existing
+            // index without writing it back.
+            return Ok(index);
+        }
+        index.ignored_count = ignored;
+        index.generated_at = now_secs();
+        crate::index::save(project, &index)?;
+    }
+
     Ok(index)
 }
 
@@ -448,4 +497,151 @@ fn detect_role(rel: &str, entry: &FileEntry) -> String {
         return "resource".into();
     }
     "unknown".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_project_dir() -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        let unique = format!(
+            "cpp_map_scan_test_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before Unix epoch")
+                .as_nanos()
+        );
+        dir.push(unique);
+        fs::create_dir_all(&dir).expect("create temp project dir");
+        dir.canonicalize().expect("canonicalize temp project dir")
+    }
+
+    fn write_source(dir: &Path, name: &str, contents: &str) {
+        fs::write(dir.join(name), contents).expect("write source file");
+    }
+
+    #[test]
+    fn readonly_mode_errors_when_index_is_missing_and_writes_nothing() {
+        let dir = temp_project_dir();
+        write_source(&dir, "main.cpp", "int main() { return 0; }");
+
+        let err = ensure_fresh(&dir, FreshnessMode::ReadOnly).expect_err("missing index errors");
+        assert!(err.starts_with("index_not_found"));
+        assert!(!crate::index::index_path(&dir).exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn readonly_mode_rejects_drifted_index_without_writing() {
+        let dir = temp_project_dir();
+        write_source(&dir, "main.cpp", "int main() { return 0; }");
+        let result = scan(&dir).expect("initial scan");
+        crate::index::save(&dir, &result.index).expect("save index");
+        let saved_before =
+            fs::read_to_string(crate::index::index_path(&dir)).expect("read saved index");
+
+        // Change the file's content/size so ensure_fresh sees drift.
+        write_source(&dir, "main.cpp", "int main() { return 100; }");
+
+        let err = ensure_fresh(&dir, FreshnessMode::ReadOnly)
+            .expect_err("drifted index must error in readonly mode");
+        assert!(err.contains("auto-scan is disabled"));
+        assert!(err.contains("--allow-auto-scan"));
+
+        let saved_after =
+            fs::read_to_string(crate::index::index_path(&dir)).expect("read index after call");
+        assert_eq!(
+            saved_before, saved_after,
+            "readonly mode must not write index.json"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn readonly_mode_allows_ignored_file_count_only_drift_without_writing() {
+        let dir = temp_project_dir();
+        write_source(&dir, "main.cpp", "int main() { return 0; }");
+
+        let result = scan(&dir).expect("initial scan");
+        crate::index::save(&dir, &result.index).expect("save index");
+
+        let saved_before =
+            fs::read_to_string(crate::index::index_path(&dir)).expect("read saved index");
+
+        fs::write(dir.join("note.txt"), "ignored").expect("write ignored file");
+
+        let index = ensure_fresh(&dir, FreshnessMode::ReadOnly)
+            .expect("ignored-only drift should not fail in readonly mode");
+
+        assert!(index.files.contains_key("main.cpp"));
+
+        let saved_after =
+            fs::read_to_string(crate::index::index_path(&dir)).expect("read index after call");
+
+        assert_eq!(
+            saved_before, saved_after,
+            "readonly mode must not write index.json for ignored-only drift"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn readonly_mode_rejects_stale_version_without_writing() {
+        let dir = temp_project_dir();
+        write_source(&dir, "main.cpp", "int main() { return 0; }");
+        let result = scan(&dir).expect("initial scan");
+        let mut stale = result.index;
+        stale.version = INDEX_VERSION - 1;
+        crate::index::save(&dir, &stale).expect("save stale-version index");
+        let saved_before =
+            fs::read_to_string(crate::index::index_path(&dir)).expect("read saved index");
+
+        let err = ensure_fresh(&dir, FreshnessMode::ReadOnly)
+            .expect_err("stale version must error in readonly mode");
+        assert!(err.contains("auto-scan is disabled"));
+
+        let saved_after =
+            fs::read_to_string(crate::index::index_path(&dir)).expect("read index after call");
+        assert_eq!(
+            saved_before, saved_after,
+            "readonly mode must not rebuild a stale-version index"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_refresh_mode_writes_drifted_index() {
+        let dir = temp_project_dir();
+        write_source(&dir, "main.cpp", "int main() { return 0; }");
+        let result = scan(&dir).expect("initial scan");
+        crate::index::save(&dir, &result.index).expect("save index");
+        let saved_before =
+            fs::read_to_string(crate::index::index_path(&dir)).expect("read saved index");
+
+        write_source(&dir, "main.cpp", "int main() { return 100; }");
+
+        let index = ensure_fresh(&dir, FreshnessMode::AutoRefresh)
+            .expect("auto-refresh mode should rebuild the drifted index");
+        assert_eq!(
+            index.files["main.cpp"].size,
+            "int main() { return 100; }".len() as u64
+        );
+
+        let saved_after =
+            fs::read_to_string(crate::index::index_path(&dir)).expect("read index after call");
+        assert_ne!(
+            saved_before, saved_after,
+            "auto-refresh mode must persist the rebuilt index"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
