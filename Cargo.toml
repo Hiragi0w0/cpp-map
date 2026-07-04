@@ -1,6 +1,6 @@
 [package]
 name = "cpp-map"
-version = "1.0.0"
+version = "1.0.1"
 authors = ["Hiragi0w0"]
 edition = "2024"
 description = "AI-agent-oriented context compression CLI for C++Builder projects"
