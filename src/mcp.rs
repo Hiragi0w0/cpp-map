@@ -16,9 +16,10 @@ const INSTRUCTIONS: &str = "Context-compression queries for C++Builder projects.
 Typical flow: overview -> focus <feature keyword> -> related/symbols on the candidate \
 files -> snippet to read just the relevant function bodies instead of whole files, and \
 refs to find call sites before changing a function. Output is always compact JSON. \
-After the first index exists, edited/added/removed files are re-parsed automatically on \
-every query. Run `scan` first, or start the server with `--allow-auto-scan` to let \
-queries create or rebuild the index automatically.";
+By default, query tools do not create or refresh .ai-context/index.json implicitly; \
+run the scan tool first whenever the index is missing, stale, or corrupt. \
+If the server was started with --allow-auto-scan, query tools may create or refresh \
+the index automatically when needed.";
 
 pub fn serve(default_project: Option<PathBuf>, allow_auto_scan: bool) -> Result<(), String> {
     // Canonicalize once at startup: a pinned root should be an unambiguous,

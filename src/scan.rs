@@ -101,7 +101,7 @@ pub fn ensure_fresh(project: &Path, mode: FreshnessMode) -> Result<Index, String
     };
 
     let (walked, ignored) = walk_project(project)?;
-    let mut changed = false;
+    let mut indexed_changed = false;
 
     let current: BTreeMap<&str, &WalkedFile> = walked.iter().map(|w| (w.rel.as_str(), w)).collect();
     let removed: Vec<String> = index
@@ -112,7 +112,7 @@ pub fn ensure_fresh(project: &Path, mode: FreshnessMode) -> Result<Index, String
         .collect();
     for k in removed {
         index.files.remove(&k);
-        changed = true;
+        indexed_changed = true;
     }
     for w in &walked {
         let fresh = index
@@ -121,15 +121,12 @@ pub fn ensure_fresh(project: &Path, mode: FreshnessMode) -> Result<Index, String
             .is_some_and(|e| e.mtime_ms == w.mtime_ms && e.size == w.size);
         if !fresh {
             index.files.insert(w.rel.clone(), parse_entry(project, w)?);
-            changed = true;
+            indexed_changed = true;
         }
     }
-    if index.ignored_count != ignored {
-        index.ignored_count = ignored;
-        changed = true;
-    }
+    let ignored_changed = index.ignored_count != ignored;
 
-    if changed {
+    if indexed_changed {
         if mode == FreshnessMode::ReadOnly {
             return Err(readonly_error(
                 &format!(
@@ -139,6 +136,7 @@ pub fn ensure_fresh(project: &Path, mode: FreshnessMode) -> Result<Index, String
                 project,
             ));
         }
+        index.ignored_count = ignored;
         finalize(&mut index.files);
         index.project_files = index
             .files
@@ -154,7 +152,21 @@ pub fn ensure_fresh(project: &Path, mode: FreshnessMode) -> Result<Index, String
         .into();
         index.generated_at = now_secs();
         crate::index::save(project, &index)?;
+        return Ok(index);
     }
+
+    if ignored_changed {
+        if mode == FreshnessMode::ReadOnly {
+            // Only the ignored-file count drifted; the indexed files this
+            // query actually reads are unchanged, so serve the existing
+            // index without writing it back.
+            return Ok(index);
+        }
+        index.ignored_count = ignored;
+        index.generated_at = now_secs();
+        crate::index::save(project, &index)?;
+    }
+
     Ok(index)
 }
 
@@ -546,6 +558,35 @@ mod tests {
         assert_eq!(
             saved_before, saved_after,
             "readonly mode must not write index.json"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn readonly_mode_allows_ignored_file_count_only_drift_without_writing() {
+        let dir = temp_project_dir();
+        write_source(&dir, "main.cpp", "int main() { return 0; }");
+
+        let result = scan(&dir).expect("initial scan");
+        crate::index::save(&dir, &result.index).expect("save index");
+
+        let saved_before =
+            fs::read_to_string(crate::index::index_path(&dir)).expect("read saved index");
+
+        fs::write(dir.join("note.txt"), "ignored").expect("write ignored file");
+
+        let index = ensure_fresh(&dir, FreshnessMode::ReadOnly)
+            .expect("ignored-only drift should not fail in readonly mode");
+
+        assert!(index.files.contains_key("main.cpp"));
+
+        let saved_after =
+            fs::read_to_string(crate::index::index_path(&dir)).expect("read index after call");
+
+        assert_eq!(
+            saved_before, saved_after,
+            "readonly mode must not write index.json for ignored-only drift"
         );
 
         let _ = fs::remove_dir_all(&dir);
