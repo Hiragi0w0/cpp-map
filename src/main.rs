@@ -1,4 +1,5 @@
 mod commands;
+mod graph;
 mod index;
 mod mcp;
 mod parse;
@@ -93,6 +94,48 @@ enum Cmd {
         /// Hard cap on returned lines (sets "truncated": true when hit)
         #[arg(long, default_value_t = 300)]
         max_lines: usize,
+    },
+    /// Show a human-oriented dependency graph for one file
+    Graph {
+        /// Relative path or unique basename. The current directory is used as
+        /// the project root unless --project is specified.
+        file: String,
+        /// Project root directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// Dependency traversal depth
+        #[arg(long, value_enum, default_value_t = graph::Depth::One)]
+        depth: graph::Depth,
+        /// Output format. Omit this to print a terminal summary plus Mermaid.
+        #[arg(long, value_enum)]
+        format: Option<graph::GraphFormat>,
+        /// Output file. Required for html/svg/png/pdf.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Open the output file with the OS default application
+        #[arg(long)]
+        open: bool,
+        /// Graphviz layout engine for svg/png/pdf output
+        #[arg(long, value_enum, default_value_t = graph::Layout::Dot)]
+        layout: graph::Layout,
+        /// Explicit Graphviz executable path
+        #[arg(long)]
+        graphviz_path: Option<PathBuf>,
+        /// Keep the intermediate .dot file for image output
+        #[arg(long)]
+        keep_dot: bool,
+        /// Include system includes such as <vector>
+        #[arg(long)]
+        include_system: bool,
+        /// Include project-external unresolved includes
+        #[arg(long)]
+        include_external: bool,
+        /// Do not add same-stem .cpp counterparts for included headers
+        #[arg(long)]
+        no_impl_pair: bool,
+        /// Show files that depend on the specified file
+        #[arg(long)]
+        reverse: bool,
     },
     /// Run as an MCP server over stdio, exposing every command as a tool
     Mcp {
@@ -193,6 +236,42 @@ fn main() -> ExitCode {
             (*max_lines).max(1),
             scan::FreshnessMode::AutoRefresh,
         ),
+        Cmd::Graph {
+            file,
+            project,
+            depth,
+            format,
+            output,
+            open,
+            layout,
+            graphviz_path,
+            keep_dot,
+            include_system,
+            include_external,
+            no_impl_pair,
+            reverse,
+        } => {
+            let options = graph::GraphOptions {
+                depth: *depth,
+                format: *format,
+                output: output.clone(),
+                open: *open,
+                layout: *layout,
+                graphviz_path: graphviz_path.clone(),
+                keep_dot: *keep_dot,
+                include_system: *include_system,
+                include_external: *include_external,
+                impl_pair: !*no_impl_pair,
+                reverse: *reverse,
+            };
+            return match graph::run_graph(project, file, &options) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Cmd::Mcp {
             project_path,
             allow_auto_scan,

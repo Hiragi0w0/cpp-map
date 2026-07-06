@@ -4,9 +4,9 @@
 
 AIエージェント専用のコンテキスト圧縮CLI。C++Builderプロジェクトを対象に、
 プロジェクト全体を読ませる代わりに「読むべきファイル・シンボル・依存関係」だけを
-JSONで返す。人間向けレポートは生成しない（Markdown出力なし）。
+JSONで返す。加えて、人間が依存関係を確認するための `graph` コマンドも備える。
 
-Version: `1.0.0`  
+Version: `1.0.1`
 Author: `Hiragi0w0`  
 Project edition: `2026`  
 Rust edition: `2024`
@@ -23,6 +23,7 @@ AIに渡すコンテキストを絞り込みやすい。
 - C++Builderプロジェクトの入口、フォーム、リポジトリ、モデル、ユーティリティをざっくり把握する
 - 日本語UI文言や機能名から、読むべきファイルをランキングする
 - `.cpp` と `.h`、include先、include元、同名実装ファイルをたどる
+- 1ファイル起点の依存関係を text / Mermaid / DOT / HTML / Graphviz画像として可視化する
 - 関数・メソッド・クラス・`__property` の候補と行番号を取得する
 - 変更前にシンボルの定義と参照箇所を分けて確認する
 - MCPサーバーとして起動し、AIエージェントから同じ機能をツールとして呼び出す
@@ -87,12 +88,27 @@ cpp-map snippet . --symbol LoadEmployees --file EmployeeListForm.cpp --context 2
 
 # シンボルの参照箇所を逆引き（定義と呼び出し箇所を分離して返す）
 cpp-map refs . LoadEmployees
+
+# カレントディレクトリをプロジェクトルートとして、人間向けの依存グラフを表示
+cpp-map graph src/A.cpp
+cpp-map graph src/A.cpp --format mermaid
+cpp-map graph src/A.cpp --format dot --output graph.dot
+cpp-map graph src/A.cpp --format html --output graph.html --open
+cpp-map graph src/A.cpp --format png --output graph.png
+cpp-map graph src/A.cpp --format svg --output graph.svg --keep-dot
 ```
 
-`scan` が必要なのは初回だけ。以降の全クエリは実行時に mtime/size を比較し、
-変更・追加・削除されたファイルだけを自動で再解析する（差分再スキャン）。
+JSONクエリ系コマンドは、最初のクエリ前に一度 `scan` を実行する。以降のクエリは
+実行時に mtime/size を比較し、変更・追加・削除されたファイルだけを自動で再解析する
+（差分再スキャン）。人間向けの `graph` コマンドは、インデックスがない場合でも初回実行時に
+自動で作成する。
 
 デフォルト出力はコンパクトなJSON。人間が読むときは `--pretty` を付ける。
+例外として、`graph` コマンドは人間向け出力であり、デフォルトではターミナル要約と
+Mermaidを表示する。プロジェクトルートがカレントディレクトリでない場合は
+`--project <dir>` を指定する。`html` / `svg` / `png` / `pdf` 出力には
+`--output <file>` が必要で、`svg` / `png` / `pdf` には Graphviz も必要になる。
+Graphviz が `PATH` にない場合は `--graphviz-path` で指定できる。
 
 ## 典型的な調査フロー
 
@@ -146,7 +162,7 @@ CLIと違い、インデックス未生成のままクエリを呼ぶと自動�
 差分再スキャンする。強制的に作り直したい場合は `scan` ツールを呼ぶ。
 
 MCPツール名はCLIサブコマンドと同じで、`scan`、`overview`、`files`、`symbols`、
-`includes`、`related`、`focus`、`refs`、`snippet` を公開する。起動時に
+`includes`、`related`、`focus`、`refs`、`snippet`、`graph` を公開する。起動時に
 プロジェクトルートを渡した場合、各ツールの `project_path` は省略できる。
 ルートを固定せずに起動した場合は、ツール呼び出しごとに `project_path` が必要になる。
 
@@ -156,6 +172,9 @@ MCPツール名はCLIサブコマンドと同じで、`scan`、`overview`、`fil
   `__history/` `Debug/` などのディレクトリは除外
 - ソース本文は原則出力せず、パス・行番号・シンボル名・関連理由を返す
   （例外は `snippet`: 問い合わせたシンボルの範囲だけを `--max-lines` 上限付きで返す）
+- `graph` は人間向けの依存グラフを表示する。標準includeとプロジェクト外includeは
+  デフォルトで除外し、includeしたヘッダーと同名の実装ファイルは自動で追加する。
+  `--reverse` で指定ファイルに依存している側も確認できる
 - インデックスと実ファイルの行ズレを検知すると `index_stale` エラーで再scanを促す
 - 完全なAST解析はせず、コメント/文字列除去 + 正規表現によるトレラントな候補抽出
   （`__fastcall` `__published` `__property` を認識）
@@ -170,6 +189,7 @@ MCPツール名はCLIサブコマンドと同じで、`scan`、`overview`、`fil
 - `src/scan.rs`: プロジェクト走査、除外ディレクトリ判定、インデックス生成、差分再スキャン
 - `src/parse.rs`: include、クラス、メソッド、関数、`__property` の候補抽出
 - `src/index.rs`: `.ai-context/index.json` の保存形式、ファイル引数解決、同名ヘッダー/実装の対応付け
+- `src/graph.rs`: 依存グラフ構築、text / Mermaid / DOT / HTML 出力、任意の Graphviz 画像出力
 - `src/commands.rs`: `overview`、`files`、`focus`、`snippet` などのクエリ処理
 - `src/mcp.rs`: JSON-RPC over stdio のMCP tools/list・tools/call実装
 
