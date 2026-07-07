@@ -295,7 +295,13 @@ fn run_tool(
                     impl_pair: !bool_arg(args, "no_impl_pair"),
                     reverse: bool_arg(args, "reverse"),
                 };
-                let graph = graph::build_graph(&project, &str_arg("file")?, &options)?;
+                // Obtain the index under the server's auto-scan policy (like
+                // every other query tool) instead of letting the graph builder
+                // create/refresh it unconditionally. Without --allow-auto-scan
+                // a missing/stale index surfaces as an error here; with it, the
+                // retry below (or ensure_fresh itself) performs the scan.
+                let index = scan::ensure_fresh(&project, mode)?;
+                let graph = graph::build_graph_from_index(&index, &str_arg("file")?, &options)?;
                 Ok(json!({ "graph": graph::render_for_format(&graph, format) }))
             }
             _ => Err(format!("unknown tool: {name}")),
@@ -641,6 +647,61 @@ mod tests {
         assert!(
             !crate::index::index_path(&project).exists(),
             "readonly mode must not write .ai-context/index.json"
+        );
+
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn graph_readonly_mode_blocks_implicit_index_write_without_allow_auto_scan() {
+        let project = temp_project_dir();
+        write_source(
+            &project,
+            "main.cpp",
+            "#include \"util.h\"\nint main(){return 0;}",
+        );
+        write_source(&project, "util.h", "");
+
+        let err = run_tool(
+            "graph",
+            &json!({ "file": "main.cpp" }),
+            Some(project.as_path()),
+            false,
+        )
+        .expect_err("graph without an index must error when auto-scan is disallowed");
+
+        assert!(err.contains("auto-scan is disabled"));
+        assert!(err.contains("--allow-auto-scan"));
+        assert!(
+            !crate::index::index_path(&project).exists(),
+            "readonly mode must not write .ai-context/index.json for graph"
+        );
+
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn graph_allow_auto_scan_lets_query_build_the_index() {
+        let project = temp_project_dir();
+        write_source(
+            &project,
+            "main.cpp",
+            "#include \"util.h\"\nint main(){return 0;}",
+        );
+        write_source(&project, "util.h", "");
+
+        let result = run_tool(
+            "graph",
+            &json!({ "file": "main.cpp" }),
+            Some(project.as_path()),
+            true,
+        )
+        .expect("graph should auto-scan when allowed");
+
+        assert!(result.get("graph").is_some());
+        assert!(
+            crate::index::index_path(&project).exists(),
+            "auto-scan mode should write .ai-context/index.json for graph"
         );
 
         let _ = fs::remove_dir_all(project);

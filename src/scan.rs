@@ -357,7 +357,14 @@ fn resolve_includes(entries: &mut BTreeMap<String, FileEntry>) {
         let mut resolved = Vec::new();
         let mut external = Vec::new();
         for raw in &entry.raw_includes {
-            let norm = raw.replace('\\', "/");
+            // Angle includes are stored with their brackets (`<windows.h>`);
+            // strip them for path matching but keep `raw` (bracket-preserved)
+            // for the external list so the graph can tag them as System.
+            let bare = raw
+                .strip_prefix('<')
+                .and_then(|s| s.strip_suffix('>'))
+                .unwrap_or(raw);
+            let norm = bare.replace('\\', "/");
             // 1) exact path relative to the includer's directory, then to the root
             let joined = if dir.is_empty() {
                 norm.clone()

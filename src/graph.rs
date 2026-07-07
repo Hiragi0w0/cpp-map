@@ -59,6 +59,10 @@ pub struct DependencyGraph {
     pub root: String,
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
+    /// True for `--reverse` graphs, where edges point includer -> target.
+    /// Text rendering walks incoming edges in that case so the tree is rooted
+    /// at the queried file with its dependents as children.
+    pub reverse: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,14 +132,27 @@ pub fn run_graph(project: &Path, file: &str, options: &GraphOptions) -> Result<(
     Ok(())
 }
 
+/// CLI entry point: obtains (creating on first run) the index, then builds the
+/// graph. MCP callers use [`build_graph_from_index`] instead so the index is
+/// obtained under the server's auto-scan policy rather than always written.
 pub fn build_graph(
     project: &Path,
     file: &str,
     options: &GraphOptions,
 ) -> Result<DependencyGraph, String> {
     let index = graph_index(project)?;
-    let root = resolve_file_arg(&index, file)?;
-    let mut builder = GraphBuilder::new(&index, root.clone(), options);
+    build_graph_from_index(&index, file, options)
+}
+
+/// Build a dependency graph from an already-loaded index. This does no index
+/// I/O of its own, so the caller controls freshness/auto-scan behaviour.
+pub fn build_graph_from_index(
+    index: &Index,
+    file: &str,
+    options: &GraphOptions,
+) -> Result<DependencyGraph, String> {
+    let root = resolve_file_arg(index, file)?;
+    let mut builder = GraphBuilder::new(index, root.clone(), options);
     if options.reverse {
         builder.build_reverse();
     } else {
@@ -211,7 +228,12 @@ impl<'a> GraphBuilder<'a> {
                 self.add_file_node(include);
                 self.add_edge(&rel, include, EdgeKind::Include);
                 queue.push_back((include.clone(), level + 1));
-                self.add_impl_pairs(include, level);
+                // A same-stem .cpp for an included header is itself a
+                // dependency to explore (its own includes pull in more files),
+                // so queue it rather than only drawing the header->impl edge.
+                for counterpart in self.add_impl_pairs(include, level) {
+                    queue.push_back((counterpart, level + 1));
+                }
             }
             self.add_external_edges(&rel, entry);
         }
@@ -246,9 +268,13 @@ impl<'a> GraphBuilder<'a> {
         }
     }
 
-    fn add_impl_pairs(&mut self, rel: &str, level: usize) {
+    /// Draw `header -> same-stem .cpp` edges and return those counterparts so
+    /// the caller can queue them for further exploration. Returns an empty list
+    /// when impl-pairing is off, the depth budget is exhausted, or `rel` is not
+    /// a header.
+    fn add_impl_pairs(&mut self, rel: &str, level: usize) -> Vec<String> {
         if !self.options.impl_pair || level >= self.max_depth() {
-            return;
+            return Vec::new();
         }
         if self
             .index
@@ -256,25 +282,27 @@ impl<'a> GraphBuilder<'a> {
             .get(rel)
             .is_none_or(|entry| entry.kind != "header")
         {
-            return;
+            return Vec::new();
         }
-        for counterpart in same_stem_counterparts(self.index, rel) {
-            self.add_file_node(&counterpart);
-            self.add_edge(rel, &counterpart, EdgeKind::ImplementationPair);
+        let counterparts = same_stem_counterparts(self.index, rel);
+        for counterpart in &counterparts {
+            self.add_file_node(counterpart);
+            self.add_edge(rel, counterpart, EdgeKind::ImplementationPair);
         }
+        counterparts
     }
 
     fn add_external_edges(&mut self, from: &str, entry: &crate::index::FileEntry) {
         for raw in &entry.external_includes {
-            let (kind, label) = classify_external(raw);
+            let (kind, key, label) = classify_external(raw);
             match kind {
                 FileKind::System if !self.options.include_system => continue,
                 FileKind::External if !self.options.include_external => continue,
                 _ => {}
             }
             let id = match kind {
-                FileKind::System => format!("system:{raw}"),
-                FileKind::External => format!("external:{raw}"),
+                FileKind::System => format!("system:{key}"),
+                FileKind::External => format!("external:{key}"),
                 _ => unreachable!("external classification must be system or external"),
             };
             self.nodes.entry(id.clone()).or_insert(GraphNode {
@@ -321,6 +349,7 @@ impl<'a> GraphBuilder<'a> {
             root: self.root,
             nodes: self.nodes.into_values().collect(),
             edges: self.edges.into_iter().collect(),
+            reverse: self.options.reverse,
         }
     }
 }
@@ -333,12 +362,17 @@ fn file_kind(kind: &str) -> FileKind {
     }
 }
 
-fn classify_external(raw: &str) -> (FileKind, String) {
-    let normalized = raw.replace('\\', "/");
-    if !normalized.contains('/') && !normalized.contains('.') {
-        (FileKind::System, format!("<{raw}>"))
+/// Classify an unresolved include into (kind, node-id key, display label).
+///
+/// Angle-bracket includes (`<windows.h>`, `<vcl.h>`, `<vector>`) are recorded
+/// with their brackets by the scanner and are always System — the `.h` suffix
+/// on `<windows.h>` must not push it into External. Quoted includes that could
+/// not be resolved inside the project are project-external (vendored/out-of-tree).
+fn classify_external(raw: &str) -> (FileKind, String, String) {
+    if let Some(inner) = raw.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+        (FileKind::System, inner.to_string(), format!("<{inner}>"))
     } else {
-        (FileKind::External, raw.to_string())
+        (FileKind::External, raw.to_string(), raw.to_string())
     }
 }
 
@@ -367,7 +401,7 @@ pub fn render_text(graph: &DependencyGraph) -> String {
         String::new(),
     ];
     lines.push(graph.root.clone());
-    let children = outgoing(graph);
+    let children = child_edges(graph);
     append_text_children(
         graph,
         &children,
@@ -379,9 +413,16 @@ pub fn render_text(graph: &DependencyGraph) -> String {
     lines.join("\n")
 }
 
+/// One edge as seen from a parent node in the text tree: the child node id and
+/// the edge kind used for its label.
+struct TextChild<'a> {
+    node: &'a str,
+    kind: EdgeKind,
+}
+
 fn append_text_children(
     graph: &DependencyGraph,
-    children: &BTreeMap<&str, Vec<&GraphEdge>>,
+    children: &BTreeMap<&str, Vec<TextChild<'_>>>,
     node: &str,
     prefix: &str,
     lines: &mut Vec<String>,
@@ -390,20 +431,21 @@ fn append_text_children(
     if !path_seen.insert(node.to_string()) {
         return;
     }
-    let edges = children.get(node).cloned().unwrap_or_default();
-    for (i, edge) in edges.iter().enumerate() {
+    let empty: Vec<TextChild<'_>> = Vec::new();
+    let edges = children.get(node).unwrap_or(&empty);
+    for (i, child) in edges.iter().enumerate() {
         let last = i + 1 == edges.len();
         let branch = if last { "`-" } else { "|-" };
         let next_prefix = if last { "  " } else { "| " };
-        let label = label_for(graph, &edge.to);
+        let label = label_for(graph, child.node);
         lines.push(format!(
             "{prefix}{branch} {}: {label}",
-            edge_kind_label(edge.kind)
+            edge_kind_label(child.kind)
         ));
         append_text_children(
             graph,
             children,
-            &edge.to,
+            child.node,
             &format!("{prefix}{next_prefix}"),
             lines,
             path_seen,
@@ -412,10 +454,22 @@ fn append_text_children(
     path_seen.remove(node);
 }
 
-fn outgoing(graph: &DependencyGraph) -> BTreeMap<&str, Vec<&GraphEdge>> {
-    let mut map: BTreeMap<&str, Vec<&GraphEdge>> = BTreeMap::new();
+/// Map each node to its tree children. For forward graphs a child is the `to`
+/// end of an outgoing edge; for reverse graphs (edges point includer -> target)
+/// a child is the `from` end of an incoming edge, so the queried file's
+/// dependents appear beneath it.
+fn child_edges(graph: &DependencyGraph) -> BTreeMap<&str, Vec<TextChild<'_>>> {
+    let mut map: BTreeMap<&str, Vec<TextChild<'_>>> = BTreeMap::new();
     for edge in &graph.edges {
-        map.entry(edge.from.as_str()).or_default().push(edge);
+        let (parent, child) = if graph.reverse {
+            (edge.to.as_str(), edge.from.as_str())
+        } else {
+            (edge.from.as_str(), edge.to.as_str())
+        };
+        map.entry(parent).or_default().push(TextChild {
+            node: child,
+            kind: edge.kind,
+        });
     }
     map
 }
@@ -805,6 +859,7 @@ mod tests {
                 to: "B.h".to_string(),
                 kind: EdgeKind::Include,
             }],
+            reverse: false,
         };
 
         assert!(render_mermaid(&graph).contains("A.cpp"));
@@ -816,5 +871,121 @@ mod tests {
         let message = graphviz_missing_message();
         assert!(message.contains("Graphviz"));
         assert!(message.contains("--graphviz-path"));
+    }
+
+    #[test]
+    fn depth_all_follows_cpp_dependency_chain() {
+        // A.cpp -> B.h ~ B.cpp -> C.h ~ C.cpp -> D.h. The .cpp counterparts must
+        // be followed so their own includes are reached, not just the headers.
+        let dir = temp_project_dir();
+        write_source(&dir, "A.cpp", "#include \"B.h\"\n");
+        write_source(&dir, "B.h", "");
+        write_source(&dir, "B.cpp", "#include \"C.h\"\n");
+        write_source(&dir, "C.h", "");
+        write_source(&dir, "C.cpp", "#include \"D.h\"\n");
+        write_source(&dir, "D.h", "");
+
+        let mut opts = options();
+        opts.depth = Depth::All;
+        let graph = build_graph(&dir, "A.cpp", &opts).expect("build graph");
+
+        for expected in ["B.cpp", "C.h", "C.cpp", "D.h"] {
+            assert!(
+                graph.nodes.iter().any(|node| node.id == expected),
+                "expected {expected} to be reached; nodes: {:?}",
+                graph.nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn depth_all_terminates_on_cyclic_dependencies() {
+        // A.cpp -> B.h ~ B.cpp -> A.h ~ A.cpp: a cycle through impl pairs.
+        let dir = temp_project_dir();
+        write_source(&dir, "A.cpp", "#include \"B.h\"\n");
+        write_source(&dir, "A.h", "");
+        write_source(&dir, "B.h", "");
+        write_source(&dir, "B.cpp", "#include \"A.h\"\n");
+
+        let mut opts = options();
+        opts.depth = Depth::All;
+        let graph = build_graph(&dir, "A.cpp", &opts).expect("build graph terminates");
+
+        // Every node appears exactly once despite the cycle.
+        let mut ids: Vec<&str> = graph.nodes.iter().map(|n| n.id.as_str()).collect();
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "cycle must not duplicate nodes");
+        assert!(graph.nodes.iter().any(|node| node.id == "B.cpp"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reverse_text_render_lists_dependents() {
+        // A.cpp and C.cpp both include Common.h; `graph Common.h --reverse
+        // --format text` must list both includers beneath the root.
+        let dir = temp_project_dir();
+        write_source(&dir, "A.cpp", "#include \"Common.h\"\n");
+        write_source(&dir, "C.cpp", "#include \"Common.h\"\n");
+        write_source(&dir, "Common.h", "");
+
+        let mut opts = options();
+        opts.reverse = true;
+        let graph = build_graph(&dir, "Common.h", &opts).expect("build graph");
+
+        let text = render_text(&graph);
+        assert!(
+            text.contains("A.cpp"),
+            "reverse text missing A.cpp:\n{text}"
+        );
+        assert!(
+            text.contains("C.cpp"),
+            "reverse text missing C.cpp:\n{text}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn include_system_shows_angle_bracket_headers() {
+        // <windows.h> / <vcl.h> have a `.h` suffix but are angle includes, so
+        // they belong to System, not External.
+        let dir = temp_project_dir();
+        write_source(
+            &dir,
+            "A.cpp",
+            "#include <windows.h>\n#include <vcl.h>\n#include \"vendor/foo.h\"\n",
+        );
+
+        let mut opts = options();
+        opts.include_system = true;
+        let graph = build_graph(&dir, "A.cpp", &opts).expect("build graph");
+        assert!(graph.nodes.iter().any(|node| node.id == "system:windows.h"));
+        assert!(graph.nodes.iter().any(|node| node.id == "system:vcl.h"));
+        // The quoted vendor include is External, so it stays hidden here.
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| node.id == "external:vendor/foo.h")
+        );
+
+        let mut opts = options();
+        opts.include_external = true;
+        let graph = build_graph(&dir, "A.cpp", &opts).expect("build graph");
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.id == "external:vendor/foo.h")
+        );
+        // Angle includes are System, so they stay hidden with only --include-external.
+        assert!(!graph.nodes.iter().any(|node| node.id == "system:windows.h"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
