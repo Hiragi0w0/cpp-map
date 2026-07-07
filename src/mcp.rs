@@ -5,7 +5,9 @@
 //! Every tool reuses the same core functions as the CLI subcommands.
 
 use crate::commands;
+use crate::graph;
 use crate::scan;
+use clap::ValueEnum;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -267,6 +269,41 @@ fn run_tool(
                 usize_arg("max_lines").unwrap_or(300).max(1),
                 mode,
             ),
+            "graph" => {
+                let format = optional_value_enum::<graph::GraphFormat>(args, "format")?;
+                if matches!(
+                    format,
+                    Some(
+                        graph::GraphFormat::Svg | graph::GraphFormat::Png | graph::GraphFormat::Pdf
+                    )
+                ) {
+                    return Err(
+                        "graph svg/png/pdf output is available from the CLI with --output"
+                            .to_string(),
+                    );
+                }
+                let options = graph::GraphOptions {
+                    depth: optional_value_enum(args, "depth")?.unwrap_or(graph::Depth::One),
+                    format,
+                    output: None,
+                    open: false,
+                    layout: graph::Layout::Dot,
+                    graphviz_path: None,
+                    keep_dot: false,
+                    include_system: bool_arg(args, "include_system"),
+                    include_external: bool_arg(args, "include_external"),
+                    impl_pair: !bool_arg(args, "no_impl_pair"),
+                    reverse: bool_arg(args, "reverse"),
+                };
+                // Obtain the index under the server's auto-scan policy (like
+                // every other query tool) instead of letting the graph builder
+                // create/refresh it unconditionally. Without --allow-auto-scan
+                // a missing/stale index surfaces as an error here; with it, the
+                // retry below (or ensure_fresh itself) performs the scan.
+                let index = scan::ensure_fresh(&project, mode)?;
+                let graph = graph::build_graph_from_index(&index, &str_arg("file")?, &options)?;
+                Ok(json!({ "graph": graph::render_for_format(&graph, format) }))
+            }
             _ => Err(format!("unknown tool: {name}")),
         }
     };
@@ -287,6 +324,26 @@ fn run_tool(
         }
         other => other,
     }
+}
+
+fn bool_arg(args: &Value, key: &str) -> bool {
+    args.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+fn optional_value_enum<T: ValueEnum>(args: &Value, key: &str) -> Result<Option<T>, String> {
+    let Some(value) = args.get(key).and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    T::from_str(value, true).map(Some).map_err(|_| {
+        format!(
+            "invalid {key}: {value}; expected one of [{}]",
+            T::value_variants()
+                .iter()
+                .filter_map(|v| v.to_possible_value().map(|p| p.get_name().to_string()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
 }
 
 fn tool_defs(has_default_project: bool) -> Vec<Value> {
@@ -418,6 +475,23 @@ fn tool_defs(has_default_project: bool) -> Vec<Value> {
                     "limit": { "type": "integer", "description": "Maximum ranked files to return (default 20)" },
                 })),
                 "required": base_required(vec!["keyword"]),
+            },
+        }),
+        json!({
+            "name": "graph",
+            "description": "Render a human-oriented dependency graph for one file. Returns text by default; format may be text, mermaid, dot, or html. Image formats are available from the CLI.",
+            "inputSchema": {
+                "type": "object",
+                "properties": properties(json!({
+                    "file": { "type": "string", "description": "Relative path or unique basename" },
+                    "depth": { "type": "string", "enum": ["1", "2", "all"], "description": "Traversal depth (default 1)" },
+                    "format": { "type": "string", "enum": ["text", "mermaid", "dot", "html"], "description": "Rendered output format" },
+                    "include_system": { "type": "boolean", "description": "Include system includes such as <vector>" },
+                    "include_external": { "type": "boolean", "description": "Include unresolved project-external includes" },
+                    "no_impl_pair": { "type": "boolean", "description": "Disable same-stem .cpp counterparts for included headers" },
+                    "reverse": { "type": "boolean", "description": "Show files that depend on the specified file" },
+                })),
+                "required": base_required(vec!["file"]),
             },
         }),
     ]
@@ -573,6 +647,61 @@ mod tests {
         assert!(
             !crate::index::index_path(&project).exists(),
             "readonly mode must not write .ai-context/index.json"
+        );
+
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn graph_readonly_mode_blocks_implicit_index_write_without_allow_auto_scan() {
+        let project = temp_project_dir();
+        write_source(
+            &project,
+            "main.cpp",
+            "#include \"util.h\"\nint main(){return 0;}",
+        );
+        write_source(&project, "util.h", "");
+
+        let err = run_tool(
+            "graph",
+            &json!({ "file": "main.cpp" }),
+            Some(project.as_path()),
+            false,
+        )
+        .expect_err("graph without an index must error when auto-scan is disallowed");
+
+        assert!(err.contains("auto-scan is disabled"));
+        assert!(err.contains("--allow-auto-scan"));
+        assert!(
+            !crate::index::index_path(&project).exists(),
+            "readonly mode must not write .ai-context/index.json for graph"
+        );
+
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn graph_allow_auto_scan_lets_query_build_the_index() {
+        let project = temp_project_dir();
+        write_source(
+            &project,
+            "main.cpp",
+            "#include \"util.h\"\nint main(){return 0;}",
+        );
+        write_source(&project, "util.h", "");
+
+        let result = run_tool(
+            "graph",
+            &json!({ "file": "main.cpp" }),
+            Some(project.as_path()),
+            true,
+        )
+        .expect("graph should auto-scan when allowed");
+
+        assert!(result.get("graph").is_some());
+        assert!(
+            crate::index::index_path(&project).exists(),
+            "auto-scan mode should write .ai-context/index.json for graph"
         );
 
         let _ = fs::remove_dir_all(project);

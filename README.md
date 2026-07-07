@@ -4,10 +4,10 @@
 
 A context-compression CLI built for AI agents. Targeting C++Builder projects,
 it returns only "the files, symbols, and dependencies worth reading" as JSON,
-instead of making the agent read the whole project. It produces no
-human-oriented reports (no Markdown output).
+instead of making the agent read the whole project. It also includes a
+human-oriented `graph` command for dependency visualization.
 
-Version: `1.0.0`  
+Version: `1.0.1`
 Author: `Hiragi0w0`  
 Project edition: `2026`  
 Rust edition: `2024`
@@ -26,6 +26,7 @@ Shift_JIS assets.
 - Get a rough grasp of a C++Builder project's entry points, forms, repositories, models, and utilities
 - Rank the files worth reading from Japanese UI text or feature names
 - Follow `.cpp` and `.h`, include targets, include sources, and same-name implementation files
+- Visualize dependencies from one file as text, Mermaid, DOT, HTML, or Graphviz images
 - Retrieve candidates and line numbers for functions, methods, classes, and `__property`
 - Separate a symbol's definition from its references before making a change
 - Run as an MCP server so an AI agent can call the same features as tools
@@ -101,13 +102,27 @@ cpp-map snippet . --symbol LoadEmployees --file EmployeeListForm.cpp --context 2
 
 # Reverse-lookup a symbol's references (returns definitions and call sites separately)
 cpp-map refs . LoadEmployees
+
+# Human-readable dependency graph from the current directory as the project root
+cpp-map graph src/A.cpp
+cpp-map graph src/A.cpp --format mermaid
+cpp-map graph src/A.cpp --format dot --output graph.dot
+cpp-map graph src/A.cpp --format html --output graph.html --open
+cpp-map graph src/A.cpp --format png --output graph.png
+cpp-map graph src/A.cpp --format svg --output graph.svg --keep-dot
 ```
 
-`scan` is only needed the first time. Every subsequent query compares mtime/size
-at runtime and automatically re-parses only the changed/added/deleted files
-(incremental re-scan).
+For the JSON query commands, run `scan` once before the first query. Every
+subsequent query compares mtime/size at runtime and automatically re-parses only
+the changed/added/deleted files (incremental re-scan). The human-facing `graph`
+command also creates the index on first use when it is missing.
 
 The default output is compact JSON. Add `--pretty` when a human is reading it.
+The `graph` command is the exception: it is human-oriented and prints a
+terminal summary plus Mermaid by default. Use `--project <dir>` when the project
+root is not the current directory. `html`/`svg`/`png`/`pdf` output requires
+`--output <file>`, and `svg`/`png`/`pdf` additionally require Graphviz. If
+Graphviz is not on `PATH`, pass `--graphviz-path`.
 
 ## A typical investigation flow
 
@@ -164,7 +179,8 @@ incremental re-scan of only changed/added/deleted files as the CLI. To force a
 full rebuild, call the `scan` tool.
 
 The MCP tool names match the CLI subcommands, exposing `scan`, `overview`,
-`files`, `symbols`, `includes`, `related`, `focus`, `refs`, and `snippet`. If
+`files`, `symbols`, `includes`, `related`, `focus`, `refs`, `snippet`, and
+`graph`. If
 you pass a project root at startup, each tool's `project_path` can be omitted.
 If you start without pinning a root, `project_path` is required on every tool
 call.
@@ -176,6 +192,9 @@ call.
 - Generally does not emit source bodies; returns paths, line numbers, symbol
   names, and relevance reasons (the exception is `snippet`, which returns only
   the queried symbol's range, capped by `--max-lines`)
+- `graph` renders a human-facing dependency graph. It excludes system and
+  project-external includes by default, adds same-stem implementations for
+  included headers, and supports reverse dependency lookup with `--reverse`
 - Detects line drift between the index and the real file and prompts a re-scan
   with an `index_stale` error
 - No full AST parse; tolerant candidate extraction via comment/string stripping
@@ -192,6 +211,7 @@ same command implementations.
 - `src/scan.rs`: project traversal, excluded-directory detection, index generation, incremental re-scan
 - `src/parse.rs`: candidate extraction for includes, classes, methods, functions, and `__property`
 - `src/index.rs`: on-disk format of `.ai-context/index.json`, file-argument resolution, same-stem header/impl pairing
+- `src/graph.rs`: dependency graph construction, text/Mermaid/DOT/HTML rendering, and optional Graphviz image output
 - `src/commands.rs`: query handling for `overview`, `files`, `focus`, `snippet`, and so on
 - `src/mcp.rs`: MCP tools/list and tools/call over JSON-RPC over stdio
 

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 pub const INDEX_DIR: &str = ".ai-context";
 pub const INDEX_FILE: &str = "index.json";
-pub const INDEX_VERSION: u32 = 3;
+pub const INDEX_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Index {

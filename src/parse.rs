@@ -28,8 +28,10 @@ pub struct ParsedSource {
     pub has_vcl_app_init: bool,
 }
 
+// Group 1 is the opening delimiter (`"` or `<`) so the bracket style is kept:
+// angle includes are system/external, quoted includes are project-local.
 static INCLUDE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(?m)^\s*#\s*include\s*["<]([^">]+)[">]"#).unwrap());
+    LazyLock::new(|| Regex::new(r#"(?m)^\s*#\s*include\s*(["<])([^">]+)[">]"#).unwrap());
 
 // `class PACKAGE TMainForm : public TForm {` — optional uppercase macro between
 // keyword and name; forward declarations don't match (a `{` is required).
@@ -67,9 +69,20 @@ const NON_METHOD_NAMES: &[&str] = &[
 ];
 
 pub fn parse_source(raw: &str) -> ParsedSource {
+    // Angle-bracket includes are stored with their brackets (`<windows.h>`) so
+    // the scanner and graph can tell system/external includes from quoted,
+    // project-local ones. Quoted includes are stored bare so path resolution
+    // can match them against project files.
     let includes: Vec<String> = INCLUDE_RE
         .captures_iter(raw)
-        .map(|c| c[1].trim().to_string())
+        .map(|c| {
+            let target = c[2].trim();
+            if &c[1] == "<" {
+                format!("<{target}>")
+            } else {
+                target.to_string()
+            }
+        })
         .collect();
     let has_dfm_pragma = raw.contains("#pragma resource") && raw.contains(".dfm");
     let has_vcl_app_init =
